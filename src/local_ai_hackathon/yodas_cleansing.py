@@ -10,6 +10,10 @@ import logging
 import json
 import shutil
 import glob
+import warnings
+import time
+
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.utils.weight_norm")
 
 # ロガーの作成
 logger = logging.getLogger(__name__)
@@ -23,6 +27,21 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
+# コマンドライン引数のパーサーを作成
+parser = argparse.ArgumentParser(description='Audio analysis and transcription')
+parser.add_argument('--start', type=int, default=0, help='Starting index of the dataset (default: 0)')
+parser.add_argument('--end', type=int, default=None, help='Ending index of the dataset (default: None, process all items)')
+parser.add_argument('--snr_threshold', type=float, default=100.0, help='SNR threshold for filtering (default: 100.0)')
+parser.add_argument('--score_threshold', type=float, default=3.0, help='Score threshold for filtering (default: 3.0)')
+parser.add_argument('--batch_size', type=int, default=200000, help='Batch size for processing (default: 200000)')
+parser.add_argument('--data_dir', type=str, default='data', help='Directory to store output data (default: data)')
+
+args = parser.parse_args()
+
+snr_threshold = args.snr_threshold
+score_threshold = args.score_threshold
+
+num_gpus = torch.cuda.device_count()
 
 # データを前処理するための関数
 def preprocess_audio(data):
@@ -55,6 +74,8 @@ def wada_snr(wav):
 
     # peak normalize, get magnitude, clip lower bound
     wav = np.array(wav)
+    if wav.size == 0:
+        return np.nan
     wav = wav / abs(wav).max()
     abs_wav = abs(wav)
     abs_wav[abs_wav < eps] = eps
@@ -90,104 +111,90 @@ def wada_snr(wav):
 
     return snr
 
-def analyze_audio_data(gpu_id, data_partition, whisper_model, snr_threshold, score_threshold, result_queue):
+def analyze_wada_snr(data_partition):
     results = []
     for item in data_partition:
-        result = process_audio_data(item, gpu_id=gpu_id, whisper_model=whisper_model, snr_threshold=snr_threshold, score_threshold=score_threshold)
-        if result:
-            results.append(result)
-    result_queue.put(results)
+        audio_data = item['audio']['array']
+        preprocess_audio_data = preprocess_audio(audio_data)
+        snr = wada_snr(preprocess_audio_data)
+        if snr_threshold > snr or np.isnan(snr):
+            continue
+        results.append((item, snr))
+    return results
 
-def process_audio_data(item, gpu_id, whisper_model, snr_threshold, score_threshold):
-    # logger.info(f"{item.get(id)}", end=",")
-    logger.debug(item)
-    if not isinstance(item, dict):
-        logger.info(f"無効なデータ形式: {item}")
-        return None
-
-    # 音声データを読み込む
-    audio_data = item['audio']['array']
-
-    # speech-mosを使用して数値を取得
+def analyze_mos(data_partition, gpu_id):
+    results = []
     torch.cuda.set_device(gpu_id)
     with torch.no_grad():
         device = torch.device(f"cuda:{gpu_id}")
-        # audio_data = torch.from_numpy(audio_data).unsqueeze(0).to(device)
-        # speech-mosの予測器を初期化
         predictor = torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True)
         predictor = predictor.to(device)
-        # サンプリングレートを取得または設定
-        sr = item['audio'].get('sampling_rate', 16000)
-        # データを前処理
-        preprocess_audio_data = preprocess_audio(audio_data)
+        for item, snr in data_partition:
+            try:
+                if not np.isnan(snr):
+                    sr = item['audio'].get('sampling_rate', 16000)
+                    preprocess_audio_data = preprocess_audio(item['audio']['array'])
 
-        snr = wada_snr(preprocess_audio_data)
-        
-        if snr_threshold > snr or np.isnan(snr):
-            return None
-        
-        # min_length = 10  # モデルの要件に基づいて、この値を調整してください
-        # if len(audio_data) < min_length:
-        #     logger.info(f"長さ {len(audio_data)} のオーディオデータをスキップします（最小必要長: {min_length}）")
-        #     return None
-        # audio_data_tensor = audio_data.unsqueeze(0).to(torch.float32)
-        audio_data_tensor = torch.from_numpy(preprocess_audio_data).unsqueeze(0).to(torch.float32).to(device)
-        score = predictor(audio_data_tensor.to(torch.float32), sr) 
+                    audio_data_tensor = torch.from_numpy(preprocess_audio_data).unsqueeze(0).to(torch.float32).to(device)
+                    score = predictor(audio_data_tensor.to(torch.float32), sr).cpu().item()
+                    results.append((item, snr, score))
+            except Exception as e:
+                logger.exception(e)
+    return results
 
-        del predictor
-        del audio_data_tensor
-        if score_threshold > score:
-            logger.debug(f"skip {score_threshold} > {score}")
-            return
+def analyze_whisper(data_partition, gpu_id):
+    results = []
+    torch.cuda.set_device(gpu_id)
+    whisper_model = whisper.load_model("large").to(torch.device(f"cuda:{gpu_id}"))
+    for item, snr, score in data_partition:
+        audio_data = item['audio']['array'].astype(np.float32)
+        transcription = whisper_model.transcribe(audio_data, language='ja')['text']
+        result = {
+            'id': item['id'],
+            'uuid': item['utt_id'],
+            'snr': float(snr),
+            'score': float(score),
+            'transcription': transcription,
+            'source_transcription': item['text'],
+            'path': item['audio']['path']
+        }
+        results.append(result)
+    return results
 
+def process_results(ds, snr_threshold, score_threshold, start, end, data_dir):
+    num_cpus = mp.cpu_count()
 
-    # データからidを取得
-    uuid = item['utt_id']
+    # wada_snrの並列処理（CPUの数に基づいて）
+    start_time_wada_snr = time.time()
+    with ProcessPoolExecutor(max_workers=num_cpus) as executor:
+        data_partitions = np.array_split(ds, num_cpus)
+        wada_snr_results = list(executor.map(analyze_wada_snr, data_partitions))
+    wada_snr_results = [item for sublist in wada_snr_results for item in sublist]
+    end_time_wada_snr = time.time()
+    elapsed_time_wada_snr = end_time_wada_snr - start_time_wada_snr
+    logger.info(f"analyze_wada_snr processing time: {elapsed_time_wada_snr:.4f} seconds")
 
-    # whisperを使用して文字起こしを行う
-    whisper_model = whisper_model.to(device)
-    audio_data = audio_data.astype(np.float32)
-    transcription = whisper_model.transcribe(audio_data, language='ja')['text']
+    # mosの並列処理
+    start_time_mos = time.time()
+    with ProcessPoolExecutor(max_workers=num_gpus) as executor:
+        mos_args = [(data_partition, gpu_id) for gpu_id, data_partition in enumerate(np.array_split(wada_snr_results, num_gpus))]
+        mos_results = list(executor.map(analyze_mos, *zip(*mos_args)))
+    mos_results = [item for sublist in mos_results for item in sublist]
+    end_time_mos = time.time()
+    elapsed_time_mos = end_time_mos - start_time_mos
+    logger.info(f"analyze_mos processing time: {elapsed_time_mos:.4f} seconds")
 
-    # 結果を指定された形式の文字列に整形
-    # result = f"{uuid}|pretraing1|JP|{transcription}"
+    # whisperの並列処理
+    start_time_whisper = time.time()
+    with ProcessPoolExecutor(max_workers=num_gpus) as executor:
+        whisper_args = [(data_partition, gpu_id) for gpu_id, data_partition in enumerate(np.array_split(mos_results, num_gpus))]
+        all_results = list(executor.map(analyze_whisper, *zip(*whisper_args)))
+    all_results = [item for sublist in all_results for item in sublist]
+    end_time_whisper = time.time()
+    elapsed_time_whisper = end_time_whisper - start_time_whisper
+    logger.info(f"analyze_whisper processing time: {elapsed_time_whisper:.4f} seconds")
 
-     # 結果を辞書形式で整形
-    
-    result = {
-        'id': item['id'],
-        'uuid': uuid,
-        'snr': float(snr),
-        'score': float(score),
-        'transcription': transcription,
-        'source_transcription': item['text'],
-        'path': item['audio']['path']
-    }
-
-    logger.info(f"result {result}")
-
-
-    return result
-
-def process_results(ds, whisper_model, snr_threshold, score_threshold, start, end, data_dir):
-    num_gpus = torch.cuda.device_count()
-    data_partitions = np.array_split(ds, num_gpus)
-
-    processes = []
-    result_queue = mp.Queue()
-    for gpu_id in range(num_gpus):
-        p = mp.Process(target=analyze_audio_data, args=(gpu_id, data_partitions[gpu_id], whisper_model, snr_threshold, score_threshold, result_queue))
-        p.start()
-        processes.append(p)
-
-    all_results = []
-    for p in processes:
-        p.join()
-
-    while not result_queue.empty():
-        results = result_queue.get()
-        if results:
-            all_results.extend(results)
+    logger.info(f"all_results {len(all_results)}")
 
     # wavディレクトリを作成
     wav_dir = os.path.join(data_dir, 'raw')
@@ -196,7 +203,7 @@ def process_results(ds, whisper_model, snr_threshold, score_threshold, start, en
     with open(os.path.join(data_dir, f'esd_{start}-{end}.list'), 'w', encoding='utf-8') as f:
         for result in all_results:
             uuid = result["uuid"]
-            f.write(f"{os.path.join(wav_dir, f'{uuid}.wav')}|pretraing1|JP|{result['transcription']}\n")
+            f.write(f"{uuid}.wav|yodasja000|JP|{result['transcription']}\n")
             src_path = result['path']
             dst_path = os.path.join(wav_dir, f"{uuid}.wav")
             shutil.copy(src_path, dst_path)
@@ -204,53 +211,29 @@ def process_results(ds, whisper_model, snr_threshold, score_threshold, start, en
     with open(os.path.join(data_dir, f'results_{start}-{end}.json'), 'w', encoding='utf-8') as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)
 
-
 if __name__ == '__main__':
-    # コマンドライン引数のパーサーを作成
-    parser = argparse.ArgumentParser(description='Audio analysis and transcription')
-    parser.add_argument('--start', type=int, default=0, help='Starting index of the dataset (default: 0)')
-    parser.add_argument('--end', type=int, default=None, help='Ending index of the dataset (default: None, process all items)')
-    parser.add_argument('--snr_threshold', type=float, default=100.0, help='SNR threshold for filtering (default: 100.0)')
-    parser.add_argument('--score_threshold', type=float, default=3.0, help='Score threshold for filtering (default: 3.0)')
-    parser.add_argument('--batch_size', type=int, default=10000, help='Batch size for processing (default: 1000)')
-    parser.add_argument('--data_dir', type=str, default='data', help='Directory to store output data (default: data)')
 
-    args = parser.parse_args()
-
-    # GPUが利用可能な場合は、GPUを使用するように設定
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # デバイス情報をログ出力
-    if device.type == "cuda":
-        num_gpus = torch.cuda.device_count()
-        logger.info(f"使用可能なGPU数: {num_gpus}")
-        logger.info(f"メインGPU: {torch.cuda.get_device_name(device)}")
-    else:
-        logger.info("CPUを使用します")
-
-    # whisperモデルを初期化
-    whisper_model = whisper.load_model("large")
-    mp.set_start_method('spawn')
+    logger.info(f"{args.start} - {args.end}")
 
     logger.info(f"data_dir {args.data_dir}")
     # データセットの読み込み
     if args.end is None:
-        ds0 = load_dataset('espnet/yodas', 'ja000', split=f'train[{args.start}:]')
+        ds0 = load_dataset('espnet/yodas', 'ja000', split="train", trust_remote_code=True)
     else:
-        ds0 = load_dataset('espnet/yodas', 'ja000', split=f'train[{args.start}:{args.end}]')
+        ds0 = load_dataset('espnet/yodas', 'ja000', split=f'train[{args.start}:{args.end}]' , trust_remote_code=True)
     logger.info(f"データ数: {len(ds0)}")
 
     # バッチ処理
     batch_size = args.batch_size
     for batch_start in range(args.start, len(ds0), batch_size):
         batch_end = min(batch_start + batch_size - 1, len(ds0))
-        batch_ds = load_dataset('espnet/yodas', 'ja000', split=f'train[{batch_start}:{batch_end}]')
+        logger.info(f"start batch {batch_start} - {batch_end}")
+        batch_ds = load_dataset('espnet/yodas', 'ja000', split=f'train[{batch_start}:{batch_end}]' , trust_remote_code=True)
 
         logger.info(f"Processing batch: {batch_start} - {batch_end}")
 
         # 分析を実行
-        process_results(batch_ds, whisper_model=whisper_model, snr_threshold=args.snr_threshold, score_threshold=args.score_threshold, start=batch_start, end=batch_end, data_dir=args.data_dir)
-
+        process_results(batch_ds, snr_threshold=args.snr_threshold, score_threshold=args.score_threshold, start=batch_start, end=batch_end, data_dir=args.data_dir)
 
      # 全てのesd.listをマージ
     esd_files = glob.glob(os.path.join(args.data_dir, 'esd_*.list'))
