@@ -137,7 +137,8 @@ def analyze_mos(data_partition, gpu_id):
 
                     audio_data_tensor = torch.from_numpy(preprocess_audio_data).unsqueeze(0).to(torch.float32).to(device)
                     score = predictor(audio_data_tensor.to(torch.float32), sr).cpu().item()
-                    results.append((item, snr, score))
+                    if score >= score_threshold:
+                        results.append((item, snr, score))
             except Exception as e:
                 logger.exception(e)
     return results
